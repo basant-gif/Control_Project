@@ -135,7 +135,8 @@ class Track:
                 reader = csv.reader(f)
                 marker_id = 0
                 for row in reader:
-                    if len(row) < 3: continue
+                    if len(row) < 3:
+                        continue
                     color_name = row[0]
                     try:
                         cx = float(row[1])
@@ -154,7 +155,7 @@ class Track:
                     marker = {
                         "header": {"frame_id": "map"},
                         "id": marker_id,
-                        "type": 2, # SPHERE
+                        "type": 2,  # SPHERE
                         "pose": {
                             "position": {"x": cx, "y": cy, "z": 0.0},
                             "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0}

@@ -73,6 +73,7 @@ class LapAnalyzer(Node):
         self.current_cte = 0.0
         self.current_heading_err = 0.0
         self.current_speed = 0.0
+        self.current_xy = (0.0, 0.0)
         self.proj_xy = (0.0, 0.0)
 
         # Publish periodic summary and HUD at 10 Hz
@@ -120,6 +121,7 @@ class LapAnalyzer(Node):
 
         x = msg.pose.pose.position.x
         y = msg.pose.pose.position.y
+        self.current_xy = (x, y)
         qz = msg.pose.pose.orientation.z
         qw = msg.pose.pose.orientation.w
         yaw = 2.0 * math.atan2(qz, qw)
@@ -169,6 +171,53 @@ class LapAnalyzer(Node):
         self.last_s = s
         self.last_state_time = now_sec
 
+    def path_tangent(self, idx, window=1.5):
+        """Path heading at waypoint idx, averaged over +/- window metres of arc.
+
+        The supplied centerline contains sub-metre jitter: roughly a third of its
+        waypoint joints turn by more than 20 degrees and many reverse direction
+        outright. Taking the heading from a single adjacent segment therefore
+        reports large, meaningless heading errors. A chord spanning a window of
+        real arc length on either side rejects that jitter while still following
+        genuine track curvature.
+        """
+        pts = self.path_points
+        n = len(pts)
+        if n < 2:
+            return 0.0
+
+        lo = hi = idx
+
+        travelled = 0.0
+        while travelled < window:
+            nxt = (lo - 1) % n
+            travelled += math.hypot(
+                pts[lo][0] - pts[nxt][0],
+                pts[lo][1] - pts[nxt][1]
+            )
+            lo = nxt
+            if lo == idx:
+                break
+
+        travelled = 0.0
+        while travelled < window:
+            nxt = (hi + 1) % n
+            travelled += math.hypot(
+                pts[nxt][0] - pts[hi][0],
+                pts[nxt][1] - pts[hi][1]
+            )
+            hi = nxt
+            if hi == idx:
+                break
+
+        dx = pts[hi][0] - pts[lo][0]
+        dy = pts[hi][1] - pts[lo][1]
+
+        if math.hypot(dx, dy) < 1e-6:
+            return pts[idx][2]
+
+        return math.atan2(dy, dx)
+
     def project_to_path(self, x, y, yaw):
         """Finds closest segment and projects (x, y) to compute exact orthogonal CTE."""
         pts = self.path_points
@@ -189,7 +238,6 @@ class LapAnalyzer(Node):
         best_dist = float('inf')
         best_proj = (pts[nearest_idx][0], pts[nearest_idx][1])
         best_s = self.path_cum_dist[nearest_idx]
-        best_seg_yaw = pts[nearest_idx][2]
         best_signed_cte = 0.0
 
         candidate_segments = [
@@ -214,14 +262,15 @@ class LapAnalyzer(Node):
                 best_dist = dist
                 best_proj = (px, py)
                 best_s = self.path_cum_dist[prev_i] + t * math.sqrt(seg_len_sq)
-                best_seg_yaw = math.atan2(dy, dx)
 
                 # Signed cross track error: positive if car is to the left of path
                 cross = dx * (y - y1) - dy * (x - x1)
                 best_signed_cte = math.copysign(dist, cross)
 
-        # Heading error in [-pi, pi]
-        heading_err = math.atan2(math.sin(yaw - best_seg_yaw), math.cos(yaw - best_seg_yaw))
+        # Heading error in [-pi, pi], measured against the jitter-rejecting
+        # tangent rather than the single nearest segment.
+        path_yaw = self.path_tangent(nearest_idx)
+        heading_err = math.atan2(math.sin(yaw - path_yaw), math.cos(yaw - path_yaw))
 
         return best_proj[0], best_proj[1], best_s, best_signed_cte, heading_err
 
@@ -253,30 +302,143 @@ class LapAnalyzer(Node):
         #    Clear per-lap history buffers (self.lap_ctes, self.lap_heading_errors,
         #    self.lap_speeds) so the next lap starts fresh.
         # ======================================================================
-        pass
+        # Compute per-lap performance statistics.
+        if self.lap_ctes:
+            mean_cte = float(np.mean(self.lap_ctes))
+            max_cte = float(np.max(self.lap_ctes))
+            rms_cte = float(
+                np.sqrt(np.mean(np.square(self.lap_ctes)))
+            )
+        else:
+            mean_cte = 0.0
+            max_cte = 0.0
+            rms_cte = 0.0
+
+        if self.lap_speeds:
+            mean_speed = float(np.mean(self.lap_speeds))
+            max_speed = float(np.max(self.lap_speeds))
+        else:
+            mean_speed = 0.0
+            max_speed = 0.0
+
+        mean_heading_error = (
+            float(np.mean(self.lap_heading_errors))
+            if self.lap_heading_errors
+            else 0.0
+        )
+
+        # Build a structured lap summary.
+        metrics = {
+            "event": "lap_complete",
+            "lap": self.lap_count,
+            "lap_time": float(lap_duration),
+            "best_lap_time": (
+                float(self.best_lap_time)
+                if self.best_lap_time is not None
+                else None
+            ),
+            "mean_cte": mean_cte,
+            "max_cte": max_cte,
+            "rms_cte": rms_cte,
+            "mean_speed": mean_speed,
+            "max_speed": max_speed,
+            "mean_heading_error_deg": math.degrees(
+                mean_heading_error
+            ),
+            "total_distance": float(self.total_distance),
+        }
+
+        # Publish the completed-lap summary as JSON.
+        msg = String()
+        msg.data = json.dumps(metrics)
+        self.metrics_pub.publish(msg)
+
+        # Structured console summary.
+        self.get_logger().info(
+            "\n"
+            "========== LAP COMPLETED ==========\n"
+            f"Lap:              {self.lap_count}\n"
+            f"Lap time:         {lap_duration:.3f} s\n"
+            f"Best lap:         {self.best_lap_time:.3f} s\n"
+            f"Mean CTE:         {mean_cte:.4f} m\n"
+            f"RMS CTE:          {rms_cte:.4f} m\n"
+            f"Max CTE:          {max_cte:.4f} m\n"
+            f"Mean speed:       {mean_speed:.3f} m/s\n"
+            f"Max speed:        {max_speed:.3f} m/s\n"
+            f"Mean heading err: {math.degrees(mean_heading_error):.3f} deg\n"
+            f"Total distance:   {self.total_distance:.3f} m\n"
+            "==================================="
+        )
+
+        # Reset per-lap statistics for the next lap.
+        self.lap_ctes.clear()
+        self.lap_heading_errors.clear()
+        self.lap_speeds.clear()
 
     def publish_telemetry(self):
         """Periodically publishes numerical telemetry and RViz visual markers at 10 Hz."""
-        # ======================================================================
-        # TODO: Telemetry Publishing for Graphing (PlotJuggler / rqt_plot) & Logging
-        #
-        # 1. Real-Time Numerical Signals (for rqt_plot / PlotJuggler):
-        #    Publish individual Float32 messages so students can graph signals live:
-        #      - self.cte_pub -> self.current_cte
-        #      - self.speed_pub -> self.current_speed
-        #      - self.heading_err_pub -> math.degrees(self.current_heading_err)
-        #      - self.lap_time_pub -> self.current_lap_time
-        #
-        # 2. JSON Telemetry Message:
-        #    Assemble a telemetry dictionary (lap, current_lap_time, last_lap_time,
-        #    best_lap_time, speed, current_cte, rms_cte, heading_err_deg) and publish
-        #    it as a serialized JSON String to self.metrics_pub.
-        #
-        # 3. Visual Telemetry (RViz):
-        #    Pass the telemetry dict to self.publish_rviz_markers(telemetry).
-        # ======================================================================
-        # Baseline start-gate visualization hook
-        self.publish_rviz_markers()
+
+        # --------------------------------------------------------------
+        # 1. Plottable scalar signals (rqt_plot / PlotJuggler)
+        # --------------------------------------------------------------
+        cte_msg = Float32()
+        cte_msg.data = float(self.current_cte)
+        self.cte_pub.publish(cte_msg)
+
+        speed_msg = Float32()
+        speed_msg.data = float(self.current_speed)
+        self.speed_pub.publish(speed_msg)
+
+        heading_msg = Float32()
+        heading_msg.data = float(
+            math.degrees(self.current_heading_err)
+        )
+        self.heading_err_pub.publish(heading_msg)
+
+        lap_time_msg = Float32()
+        lap_time_msg.data = float(self.current_lap_time)
+        self.lap_time_pub.publish(lap_time_msg)
+
+        # --------------------------------------------------------------
+        # 2. Aggregated JSON telemetry on /lap/metrics
+        # --------------------------------------------------------------
+        if self.lap_ctes:
+            rms_cte = float(
+                np.sqrt(np.mean(np.square(self.lap_ctes)))
+            )
+        else:
+            rms_cte = 0.0
+
+        telemetry = {
+            "event": "telemetry",
+            "lap": self.lap_count,
+            "current_lap_time": float(self.current_lap_time),
+            "last_lap_time": (
+                float(self.last_lap_time)
+                if self.last_lap_time is not None
+                else None
+            ),
+            "best_lap_time": (
+                float(self.best_lap_time)
+                if self.best_lap_time is not None
+                else None
+            ),
+            "speed": float(self.current_speed),
+            "current_cte": float(self.current_cte),
+            "rms_cte": rms_cte,
+            "heading_err_deg": float(
+                math.degrees(self.current_heading_err)
+            ),
+        }
+
+        telemetry_msg = String()
+        telemetry_msg.data = json.dumps(telemetry)
+        self.metrics_pub.publish(telemetry_msg)
+
+        # --------------------------------------------------------------
+        # 3. Visual telemetry (RViz)
+        # --------------------------------------------------------------
+        self.publish_rviz_markers(telemetry)
 
     def publish_rviz_markers(self, telemetry=None):
         """Renders start gate, error whisker, and on-screen HUD text in RViz."""
@@ -308,28 +470,115 @@ class LapAnalyzer(Node):
             gate.color.a = 0.7
             ma.markers.append(gate)
 
-        # ======================================================================
-        # TODO: Custom Real-Time RViz Visualizations & Telemetry HUD
-        #
-        # Develop live visual feedback to analyze controller tracking performance:
-        #
-        # Minimum Requirements:
-        # 1. Cross-Track Error Whisker (Marker.LINE_STRIP):
-        #    - Connect the vehicle rear axle (self.last_xy) to the projected point
-        #      on the path (self.proj_xy).
-        #    - Style with dynamic color (e.g., green when small, red when drifting)
-        #      so tracking deviation is immediately visible.
-        #
-        # 2. 3D Telemetry HUD Scoreboard (Marker.TEXT_VIEW_FACING):
-        #    - Position floating text above the track start or trailing the vehicle.
-        #    - Display live lap number, lap time, speed, CTE, and best lap time.
-        #
-        # Creative / Bonus Ideas (Optional):
-        #  - Controller Lookahead Preview: Render a Marker.SPHERE at target waypoint.
-        #  - Vehicle Breadcrumbs / Trajectory History: Render a Marker.POINTS trail
-        #    color-coded by speed or CTE magnitude.
-        #  - Lateral Acceleration Gauge: Render a vertical bar showing cornering load.
-        # ======================================================================
+        # ----------------------------------------------------------------------
+        # Marker 2: Cross-Track Error Whisker, colour-graded by |CTE|
+        # Green at or below cte_good, red at or above cte_bad, linear between.
+        # ----------------------------------------------------------------------
+        abs_cte = abs(float(self.current_cte))
+        cte_good = 0.25
+        cte_bad = 1.00
+        severity = (abs_cte - cte_good) / (cte_bad - cte_good)
+        severity = max(0.0, min(1.0, severity))
+
+        whisker = Marker()
+        whisker.header.frame_id = 'map'
+        whisker.header.stamp = now
+        whisker.ns = 'tracking_error'
+        whisker.id = 0
+        whisker.type = Marker.LINE_STRIP
+        whisker.action = Marker.ADD
+        whisker.pose.orientation.w = 1.0
+        whisker.scale.x = 0.05
+        whisker.color.r = float(severity)
+        whisker.color.g = float(1.0 - severity)
+        whisker.color.b = 0.0
+        whisker.color.a = 1.0
+
+        p_vehicle = Point()
+        p_vehicle.x = float(self.current_xy[0])
+        p_vehicle.y = float(self.current_xy[1])
+        p_vehicle.z = 0.05
+        whisker.points.append(p_vehicle)
+
+        p_projection = Point()
+        p_projection.x = float(self.proj_xy[0])
+        p_projection.y = float(self.proj_xy[1])
+        p_projection.z = 0.05
+        whisker.points.append(p_projection)
+
+        ma.markers.append(whisker)
+
+        # ----------------------------------------------------------------------
+        # Marker 3: Projected reference point on the path
+        # ----------------------------------------------------------------------
+        projection = Marker()
+        projection.header.frame_id = 'map'
+        projection.header.stamp = now
+        projection.ns = 'tracking_error'
+        projection.id = 1
+        projection.type = Marker.SPHERE
+        projection.action = Marker.ADD
+        projection.pose.position.x = float(self.proj_xy[0])
+        projection.pose.position.y = float(self.proj_xy[1])
+        projection.pose.position.z = 0.15
+        projection.pose.orientation.w = 1.0
+        projection.scale.x = 0.30
+        projection.scale.y = 0.30
+        projection.scale.z = 0.30
+        projection.color.r = 0.0
+        projection.color.g = 0.8
+        projection.color.b = 1.0
+        projection.color.a = 0.9
+        ma.markers.append(projection)
+
+        # ----------------------------------------------------------------------
+        # Marker 4: 3D telemetry HUD scoreboard, trailing the vehicle
+        # ----------------------------------------------------------------------
+        if telemetry is None:
+            telemetry = {
+                "lap": self.lap_count,
+                "current_lap_time": float(self.current_lap_time),
+                "best_lap_time": self.best_lap_time,
+                "speed": float(self.current_speed),
+                "current_cte": float(self.current_cte),
+                "rms_cte": 0.0,
+                "heading_err_deg": float(
+                    math.degrees(self.current_heading_err)
+                ),
+            }
+
+        best = telemetry.get("best_lap_time")
+        best_text = f"{best:.2f} s" if best is not None else "--"
+
+        last = telemetry.get("last_lap_time")
+        last_text = f"{last:.2f} s" if last is not None else "--"
+
+        hud = Marker()
+        hud.header.frame_id = 'map'
+        hud.header.stamp = now
+        hud.ns = 'telemetry_hud'
+        hud.id = 0
+        hud.type = Marker.TEXT_VIEW_FACING
+        hud.action = Marker.ADD
+        hud.pose.position.x = float(self.current_xy[0])
+        hud.pose.position.y = float(self.current_xy[1])
+        hud.pose.position.z = 1.8
+        hud.pose.orientation.w = 1.0
+        hud.scale.z = 0.45
+        hud.color.r = 1.0
+        hud.color.g = 1.0
+        hud.color.b = 1.0
+        hud.color.a = 1.0
+        hud.text = (
+            f"LAP {telemetry.get('lap', 0)}   "
+            f"T {telemetry.get('current_lap_time', 0.0):.2f} s\n"
+            f"Last {last_text}   Best {best_text}\n"
+            f"v {telemetry.get('speed', 0.0):.2f} m/s\n"
+            f"CTE {telemetry.get('current_cte', 0.0):+.3f} m   "
+            f"RMS {telemetry.get('rms_cte', 0.0):.3f} m\n"
+            f"Heading {telemetry.get('heading_err_deg', 0.0):+.1f} deg"
+        )
+        ma.markers.append(hud)
 
         self.viz_pub.publish(ma)
 

@@ -17,8 +17,8 @@ from std_msgs.msg import Float32
 # ==============================================================================
 # Phase 2 (Milestone 4): Uncomment these imports when upgrading to cruise control
 # ==============================================================================
-# from nav_msgs.msg import Odometry
-# from bicycle_control.longitudinal_pid import PIDLongitudinalController
+from nav_msgs.msg import Odometry
+from bicycle_control.longitudinal_pid import PIDLongitudinalController
 
 
 class TeleopBridge(Node):
@@ -49,32 +49,108 @@ class TeleopBridge(Node):
         self.current_throttle = 0.0
         self.current_steer = 0.0
         self.target_vel = 0.0
+        self.current_velocity = 0.0
         self.last_cmd_time = self.get_clock().now()
 
-        # TODO: Phase 2 (Milestone 4.2) — Closed-Loop Cruise Control Setup
-        # This allows the car to automatically hold a steady speed instead of requiring manual throttle.
-        # Initialize the PID speed controller and subscribe to odometry data.
+        # Closed-loop cruise control setup
+        self.pid_longitudinal = PIDLongitudinalController(
+            kp=1.0,
+            ki=0.2,
+            kd=0.05,
+            dt=0.1
+        )
+
+        if self.use_cruise_control:
+            self.state_sub = self.create_subscription(
+                Odometry,
+                '/state',
+                self.odom_callback,
+                10
+            )
+
+            self.get_logger().info(
+                'Closed-loop cruise control ENABLED'
+            )
 
         # Publish loop at 10 Hz
         self.timer = self.create_timer(0.1, self.publish_commands)
 
-    # def odom_callback(self, msg: Odometry):
-    #     """Milestone 4.2: Extracts vehicle forward speed from /state odometry."""
-    #     pass
+    def odom_callback(self, msg: Odometry):
+        """Extract the vehicle forward speed from /state."""
+        self.current_velocity = float(msg.twist.twist.linear.x)
 
     def cmd_callback(self, msg: Twist):
-        """Translates Twist linear.x to throttle [-1, 1] and angular.z into steering (rad)."""
-        # TODO: Milestone 3.1 — Teleoperation Command Mapping
-        # This connects user inputs (keyboard/joystick) to the car's physical actuators.
-        # Map the incoming Twist linear/angular commands to throttle and steering.
-        pass
+        """Process teleoperation commands in open-loop or cruise-control mode."""
+
+        # Map angular velocity command to steering angle.
+        steer = (
+            msg.angular.z / self.max_angular_vel
+        ) * self.max_steer_rad
+
+        steer = float(
+            np.clip(
+                steer,
+                -self.max_steer_rad,
+                self.max_steer_rad
+            )
+        )
+
+        self.current_steer = steer
+
+        if self.use_cruise_control:
+            # In cruise-control mode, linear.x is the target speed.
+            self.target_vel = float(
+                np.clip(
+                    msg.linear.x,
+                    -self.max_linear_vel,
+                    self.max_linear_vel
+                )
+            )
+        else:
+            # Normal teleoperation: linear.x directly controls throttle/brake.
+            throttle = msg.linear.x / self.max_linear_vel
+            self.current_throttle = float(
+                np.clip(throttle, -1.0, 1.0)
+            )
+
+        # Reset the watchdog whenever a command arrives.
+        self.last_cmd_time = self.get_clock().now()
 
     def publish_commands(self):
-        """Periodically publishes throttle and steering commands at 10 Hz."""
-        # TODO: Milestone 3.2 — Safety Watchdog & Command Publishing
-        # This prevents the car from running away if the user's connection drops.
-        # Publish the commands, or zero them out if the last command is too old.
-        pass
+        """Publish throttle and steering at 10 Hz with a safety watchdog."""
+
+        now = self.get_clock().now()
+        elapsed = (now - self.last_cmd_time).nanoseconds * 1e-9
+
+        if elapsed > self.auto_zero_timeout:
+            # Safety watchdog.
+            throttle = 0.0
+            steer = 0.0
+
+            if self.use_cruise_control:
+                self.target_vel = 0.0
+                self.pid_longitudinal.integral = 0.0
+                self.pid_longitudinal.prev_error = 0.0
+
+        else:
+            steer = self.current_steer
+
+            if self.use_cruise_control:
+                # Closed-loop speed control.
+                throttle = self.pid_longitudinal.compute(
+                    self.target_vel,
+                    self.current_velocity
+                )
+            else:
+                throttle = self.current_throttle
+
+        throttle_msg = Float32()
+        throttle_msg.data = float(throttle)
+        self.throttle_pub.publish(throttle_msg)
+
+        steer_msg = Float32()
+        steer_msg.data = float(steer)
+        self.steer_pub.publish(steer_msg)
 
 
 def main(args=None):
